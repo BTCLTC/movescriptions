@@ -25,6 +25,12 @@ module smartinscription::movescription {
     const MAX_MINT_FEE: u64 = 100_000_000_000;
     const EPOCH_DURATION_MS: u64 = 60 * 1000;
     const MIN_EPOCHS: u64 = 60*2;
+    const EPOCH_MAX_PLAYER: u64 = 500;
+    const BASE_EPOCH_COUNT: u64 = 60*24*15;
+    const BASE_TICK_LENGTH_FEE: u64 = 1000;
+    const BASE_EPOCH_COUNT_FEE: u64 = 100;
+    const PROTOCOL_TICK: vector<u8> = b"MOVE";
+    const PROTOCOL_START_TIME_MS: u64 = 1704038400*1000;
 
     // ======== Errors =========
     const ErrorTickLengthInvaid: u64 = 1;
@@ -36,13 +42,16 @@ module smartinscription::movescription {
     const ENotSameTick: u64 = 10;
     //const EBalanceDONE: u64 = 11;
     const ETooHighFee: u64 = 12;
-    const EStillMinting: u64 = 13;
+    //const EStillMinting: u64 = 13;
     const ENotStarted: u64 = 14;
     const EInvalidEpoch: u64 = 15;
     const EAttachCoinExists: u64 = 16;
     const EInvalidStartTime: u64 = 17;
     const ENotSameMetadata: u64 = 18;
     const EVersionMismatched: u64 = 19;
+    const EDeprecatedFunction: u64 = 20;
+    const EInvalidFeeTick: u64 = 21;
+    const ENotEnoughDeployFee: u64 = 22;
 
     // ======== Types =========
     struct Movescription has key, store {
@@ -131,7 +140,7 @@ module smartinscription::movescription {
     // ======== Functions =========
     fun init(otw: MOVESCRIPTION, ctx: &mut TxContext) {
         let deploy_record = DeployRecord { id: object::new(ctx), version: VERSION, record: table::new(ctx) };
-        do_deploy(&mut deploy_record, b"MOVE", 100_0000_0000, 1704038400*1000, 60*24*15, 100000000, ctx);
+        do_deploy(&mut deploy_record, PROTOCOL_TICK, 100_0000_0000, PROTOCOL_START_TIME_MS, 60*24*15, 100000000, ctx);
         transfer::share_object(deploy_record);
         let keys = vector[
             std::string::utf8(b"tick"),
@@ -228,8 +237,11 @@ module smartinscription::movescription {
         });
     }
 
-    public entry fun deploy(
-        deploy_record: &mut DeployRecord, 
+    #[lint_allow(self_transfer)]
+    public entry fun deploy_v2(
+        deploy_record: &mut DeployRecord,
+        fee_tick_record: &mut TickRecord,
+        fee_scription: &mut Movescription, 
         tick: vector<u8>,
         total_supply: u64,
         start_time_ms: u64,
@@ -243,8 +255,31 @@ module smartinscription::movescription {
         if(start_time_ms == 0){
             start_time_ms = now_ms;
         };
-        assert!(start_time_ms >= now_ms, EInvalidStartTime); 
+        assert!(start_time_ms >= now_ms, EInvalidStartTime);
+        assert!(fee_scription.tick == string(PROTOCOL_TICK), EInvalidFeeTick);
+        assert!(fee_tick_record.tick == fee_scription.tick, EInvalidFeeTick);
+
+        let deploy_fee_amount = calculate_deploy_fee(tick, epoch_count);
+        assert!(fee_scription.amount >= deploy_fee_amount, ENotEnoughDeployFee);
+        let deploy_fee = do_split(fee_scription, deploy_fee_amount, ctx);
+        //Burn the fee and Return the acc SUI to the deployer
+        let acc_in_deploy_fee = do_burn(fee_tick_record, deploy_fee, ctx);
+        let deployer: address = tx_context::sender(ctx);
+        transfer::public_transfer(acc_in_deploy_fee, deployer); 
         do_deploy(deploy_record, tick, total_supply, start_time_ms, epoch_count, mint_fee, ctx);
+    }
+
+    public entry fun deploy(
+        _deploy_record: &mut DeployRecord, 
+        _tick: vector<u8>,
+        _total_supply: u64,
+        _start_time_ms: u64,
+        _epoch_count: u64,
+        _mint_fee: u64,
+        _clk: &Clock,
+        _ctx: &mut TxContext
+    ) {
+        abort EDeprecatedFunction
     }
 
     #[lint_allow(self_transfer)]
@@ -276,8 +311,10 @@ module smartinscription::movescription {
         if (table::contains(&tick_record.epoch_records, current_epoch)){
             let epoch_record: &mut EpochRecord = table::borrow_mut(&mut tick_record.epoch_records, current_epoch);
             mint_in_epoch(epoch_record, sender, fee_balance);
-            // if the epoch is over, we need to settle it and start a new epoch
-            if (epoch_record.start_time_ms + EPOCH_DURATION_MS < now_ms) {
+            // If the epoch is over, we need to settle it and start a new epoch
+            // If the epoch player is full, we do not wait and start a new epoch
+            let epoch_player_len = vector::length(&epoch_record.players);
+            if (epoch_record.start_time_ms + EPOCH_DURATION_MS < now_ms || epoch_player_len >= EPOCH_MAX_PLAYER) {
                 settlement(tick_record, current_epoch, sender,  now_ms, ctx);
             };
         } else {
@@ -315,23 +352,6 @@ module smartinscription::movescription {
         assert!(tick_record.tick == tick_str, ErrorTickNotExists);  // parallel optimization
         do_mint(tick_record, fee_coin, clk, ctx);
     }
-
-    // Mint by transfer SUI to the TickRecord Object
-    //TODO need to figure out why this function can not be called
-    // public fun mint_by_transfer(tick_record: &mut TickRecord, sent: Receiving<Coin<SUI>>, ctx: &mut TxContext) {
-    //     assert!(tick_record.version == VERSION, EVersionMismatched);
-    //     std::debug::print(&string(b"mint_by_transfer"));
-    //     assert!(tick_record.remain > 0, ENotEnoughToMint);
-    //     let sender: address = tx_context::sender(ctx); 
-    //     let coin = transfer::public_receive(&mut tick_record.id, sent);
-    //     assert!(coin::value<SUI>(&coin) == tick_record.mint_fee, ETooHighFee);
-    //     let current_epoch = tick_record.current_epoch;
-    //     assert!(table::contains(&tick_record.epoch_records, current_epoch), ENotStarted);
-        
-    //     tick_record.total_transactions = tick_record.total_transactions + 1;
-    //     let epoch_record: &mut EpochRecord = table::borrow_mut(&mut tick_record.epoch_records, current_epoch);
-    //     mint_in_epoch(epoch_record, sender, coin::into_balance<SUI>(coin));
-    // }
 
     fun new_epoch_record(tick: String, epoch: u64, now_ms: u64, sender: address, fee_balance: Balance<SUI>, ctx: &mut TxContext) : EpochRecord{
         let mint_fees = table::new(ctx);
@@ -490,35 +510,6 @@ module smartinscription::movescription {
         coin::put(&mut inscription.acc, receive);
     }
 
-    // public fun accept_coin<T>(inscription: &mut Movescription, sent: Receiving<Coin<T>>) {
-    //     let coin = transfer::public_receive(&mut inscription.id, sent);
-    //     let inscription_balance_type = InscriptionBalance<T>{};
-    //     let inscription_uid = &mut inscription.id;
-
-    //     if (df::exists_(inscription_uid, inscription_balance_type)) {
-    //         let balance: &mut Coin<T> = df::borrow_mut(inscription_uid, inscription_balance_type);
-    //         coin::join(balance, coin);
-    //     } else {
-    //         inscription.attach_coin = inscription.attach_coin + 1;
-    //         df::add(inscription_uid, inscription_balance_type, coin);
-    //     }
-    // }
-
-    // public fun withdraw_all<T>(inscription: &mut Movescription): Coin<T> {
-    //     let inscription_balance_type = InscriptionBalance<T>{};
-    //     let inscription_uid = &mut inscription.id;
-    //     assert!(df::exists_(inscription_uid, inscription_balance_type), EBalanceDONE);
-    //     inscription.attach_coin = inscription.attach_coin - 1;
-    //     let return_coin: Coin<T> = df::remove(inscription_uid, inscription_balance_type);
-    //     return_coin
-    // }
-
-    public fun clean_epoch_records(tick_record: &mut TickRecord, _epoch: u64, _ctx: &mut TxContext) {
-        assert!(tick_record.remain == 0, EStillMinting);
-        assert!(tick_record.version == VERSION, EVersionMismatched);
-        //TODO clean the epoch records
-    }
-
     // ======== Movescription Read Functions =========
     public fun amount(inscription: &Movescription): u64 {
         inscription.amount
@@ -579,6 +570,33 @@ module smartinscription::movescription {
         MIN_EPOCHS
     }
 
+    public fun epoch_max_player(): u64 {
+        EPOCH_MAX_PLAYER
+    }
+
+    public fun protocol_tick(): vector<u8> {
+        PROTOCOL_TICK
+    }
+
+    public fun protocol_start_time_ms(): u64 {
+        PROTOCOL_START_TIME_MS
+    }
+
+    public fun calculate_deploy_fee(tick: vector<u8>, epoch_count: u64): u64 {
+        assert!(epoch_count >= MIN_EPOCHS, EInvalidEpoch);
+        let tick_len: u64 = ascii::length(&string(tick));
+        assert!(tick_len >= MIN_TICK_LENGTH && tick_len <= MAX_TICK_LENGTH, ErrorTickLengthInvaid);
+        let tick_len_fee =  BASE_TICK_LENGTH_FEE * MIN_TICK_LENGTH/tick_len;
+        let epoch_fee = if(epoch_count >= BASE_EPOCH_COUNT){
+            BASE_EPOCH_COUNT_FEE
+        }else{
+            BASE_EPOCH_COUNT * BASE_EPOCH_COUNT_FEE / epoch_count
+        };
+        tick_len_fee + epoch_fee
+    }
+
+    // ========= Test Functions =========
+
     #[test_only]
     public fun init_for_testing(ctx: &mut TxContext) {
         init(MOVESCRIPTION{}, ctx);
@@ -611,5 +629,21 @@ module smartinscription::movescription {
         let new_acc_amount = split_acc(acc_amount, split_amount, inscription_amount);
         //std::debug::print(&new_acc_amount);
         assert!(new_acc_amount == 1u64, 0);
+    }
+
+    #[test]
+    fun test_calculate_deploy_fee(){
+        let fee = calculate_deploy_fee(b"MOVE", BASE_EPOCH_COUNT);
+        assert!(fee == 1100, 0);
+        let fee = calculate_deploy_fee(b"MOVER", BASE_EPOCH_COUNT);
+        assert!(fee == 900, 0);
+        let fee = calculate_deploy_fee(b"MMMMMMMMMMMMMMMMMMMMMMMMMMMMOVER", BASE_EPOCH_COUNT);
+        assert!(fee == 225, 0);
+        let fee = calculate_deploy_fee(b"MOVE", 60*24);
+        //std::debug::print(&fee);
+        assert!(fee == 2500, 0);
+        let fee = calculate_deploy_fee(b"MOVE", MIN_EPOCHS);
+        assert!(fee == 19000, 0); 
+        //std::debug::print(&fee);
     }
 }
